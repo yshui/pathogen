@@ -1,0 +1,5 @@
+name "pathogen"
+description "Intuitive Parser Generator"
+authors "Yuxuan Shui"
+copyright "Copyright © 2018, Yuxuan Shui"
+license "MIT"

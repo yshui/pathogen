@@ -1,0 +1,14 @@
+.dub
+docs.json
+__dummy.html
+docs/
+pathogen.so
+pathogen.dylib
+pathogen.dll
+pathogen.a
+pathogen.lib
+pathogen-test-*
+*.exe
+*.o
+*.obj
+*.lst
