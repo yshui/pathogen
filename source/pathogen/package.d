@@ -9,4 +9,5 @@ module pathogen;
 
 public import pathogen.base;
 import pathogen.gene : gene;
+
 mixin gene!();

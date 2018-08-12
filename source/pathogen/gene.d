@@ -1,7 +1,7 @@
 module pathogen.gene;
 import pathogen.base;
 
-template gene() {
+package template gene() {
 
 import std.experimental.allocator;
 import std.experimental.allocator.gc_allocator : GCAllocator;
@@ -10,9 +10,11 @@ import std.traits;
 import std.exception;
 import std.meta;
 import std.variant;
+import pathogen.utils : scc;
+debug import std.stdio;
 
 @safe:
-private struct genRuleCon(T, Parsers...) {
+private template genRuleCon(T, Parsers...) {
 	static if (__traits(compiles, AliasSeq!(__traits(getAttributes, T))))
 		private alias Attrs = AliasSeq!(__traits(getAttributes, T));
 	else
@@ -45,46 +47,49 @@ private struct genRuleCon(T, Parsers...) {
 			enum hasAnyType = anySatisfy(hasTypeR!S, T);
 		}
 	}
-	static if (Attrs.length == 0)
-		mixin genRuleImpl!(T, Parsers);
-	else {
-		private struct Inner {
-			mixin genRuleImpl!(T, Parsers);
+	private alias Inner = genRuleImpl!(T, Parsers);
+	static if (is(typeof(Inner.ruleName) == string))
+		enum ruleName = Inner.ruleName;
+
+	private alias s = Filter!(hasType!surround, Attrs);
+	static assert(s.length <= 1, "Can't have multiple surround attributes.");
+	static if (s.length == 1) {
+		alias innerRules = AliasSeq!(Inner.innerRules, s[0].L, s[0].R);
+		static bool calcEmptiness()(ref DFSState!bool state) {
+			return .calcEmptiness!(s[0].L, Parsers)(state) &&
+			       .calcEmptiness!(T, Parsers)(state) &&
+			       .calcEmptiness!(s[0].R, Parsers)(state);
 		}
-		static if (is(typeof(Inner.ruleName)))
-			enum ruleName = Inner.ruleName;
+		private alias l = leftMostOfSeq!Parsers;
+		alias leftMost = l!(s[0].L, T, s[0].R);
+		private enum desc1 = "( "~getDesc!(s[0].L)~" ) ( "~Inner.desc~" ) ( "~getDesc!(s[0].R)~" )";
+		static if (s[0].optional)
+			enum desc = "( " ~ desc1 ~ " ) | " ~ Inner.desc;
+		else
+			enum desc = desc1;
+		static Result!(R, T) parse(R, Alloc)(R i, ref Memo!(R, Alloc, Parsers) m, auto ref Alloc alloc) {
+			alias lp = pathogenImpl!(s[0].L, Parsers);
+			auto lr = lp!(R, Alloc)(i, m, alloc);
+			if (!lr.is_ok && !s[0].optional)
+				return Result!(R, T)(lr.err);
 
-		private alias s = Filter!(hasType!surround, Attrs);
-		static assert(s.length <= 1, "Can't have multiple surround attributes.");
-		static if (s.length == 1) {
-			alias innerRules = AliasSeq!(Inner.innerRules, s[0].L, s[0].R);
-			private enum desc1 = "( "~getDesc!(s[0].L)~" ) ( "~Inner.desc~" ) ( "~getDesc!(s[0].R)~" )";
-			static if (s[0].optional)
-				enum desc = "( " ~ desc1 ~ " ) | " ~ Inner.desc;
-			else
-				enum desc = desc1;
-			static Result!(R, T) parse(R, Alloc)(R i, ref Memo!(R, Alloc, Parsers) m, auto ref Alloc alloc) {
-				alias lp = pathogen!(s[0].L, Parsers);
-				auto lr = lp!(R, Alloc)(i, m, alloc);
-				if (!lr.is_ok && !s[0].optional)
-					return Result!(R, T)(lr.err);
-
-				alias mp = pathogen!(T, Parsers);
-				auto mr = mp!(R, Alloc)(lr.is_ok ? lr.next : i, m, alloc);
-				if (!mr.is_ok)
-					return mr;
-
-				alias rp = pathogen!(s[0].R, Parsers);
-				auto rr = rp!(R, Alloc)(mr.next, m, alloc);
-				if (rr.is_ok != lr.is_ok)
-					return Result!(R, T)(lr.is_ok ? rr.err : lr.err);
+			alias mp = pathogenImpl!(T, Parsers);
+			auto mr = mp!(R, Alloc)(lr.is_ok ? lr.next : i, m, alloc);
+			if (!mr.is_ok)
 				return mr;
-			}
-		} else {
-			alias innerRules = Inner.innerRules;
-			enum desc = Inner.desc;
-			alias parse = Inner.parse;
+
+			alias rp = pathogenImpl!(s[0].R, Parsers);
+			auto rr = rp!(R, Alloc)(mr.next, m, alloc);
+			if (rr.is_ok != lr.is_ok)
+				return Result!(R, T)(lr.is_ok ? rr.err : lr.err);
+			return mr;
 		}
+	} else {
+		alias innerRules = Inner.innerRules;
+		enum desc = Inner.desc;
+		alias parse = Inner.parse;
+		alias calcEmptiness = Inner.calcEmptiness;
+		alias leftMost = Inner.leftMost;
 	}
 }
 
@@ -102,6 +107,31 @@ version(unittest) {
 	interface I {}
 	class D1: I {}
 	class D2: I {}
+	@localVariants
+	class B {
+		B a1;
+		Token!"z" a2;
+		@safe this(B x, Token!"z") { a1 = x; }
+		@safe this() {}
+	}
+	class A {
+		B a1;
+		@safe this(B x) { a1 = x; }
+	}
+	class B2: B {
+		A a1;
+		Token!"j" a2;
+		@safe this(A x, Token!"j") { a1 = x; }
+	}
+	class B3: B {
+		A a1;
+		Token!"x" a2;
+		@safe this(A x, Token!"x") { a1 = x; }
+	}
+	class B4: B {
+		Token!"x" a1;
+		@safe this(Token!"x") { }
+	}
 
 }
 
@@ -128,10 +158,12 @@ private string seqRulesDesc(T...)() {
 		parts ~= "ε";
 	foreach(u; T) {
 		alias rc = genRuleCon!u;
-		static if (is(typeof(rc.ruleName) == string)) {
+		alias allM = AliasSeq!(__traits(allMembers, rc)); // Hack for issue 19190
+		static if (is(typeof(rc.ruleName))) {
 			parts ~= rc.ruleName;
-		} else
+		} else {
 			parts ~= "( "~getDesc!u~" )";
+		}
 	}
 	return parts.join(" ");
 }
@@ -148,21 +180,33 @@ private string orRulesDesc(T...)() {
 	return parts.join(" | ");
 }
 
-template genRuleImpl(T: Epislon[0], _...) {
+// parser template can use this to check if PGS is passed to the template
+// and use it accordingly.
+private enum hasPGS(T...) = is(typeof(T[0]) == PGS);
+
+template genRuleImpl(T: Epislon, _...) {
 	enum desc = "ε";
 	alias innerRules = AliasSeq!();
-	static Result!R parse(R, Alloc)(R i, Alloc alloc) {
-		return Result!R(i);
+	alias leftMost = AliasSeq!();
+	static bool calcEmptiness(in ref DFSState!bool) {
+		return true;
+	}
+	static Result!(R, T) parse(R, Alloc)(R i, Alloc alloc) {
+		return Result!(R, T)(i, Epislon.init);
 	}
 }
 
 template genRuleImpl(T, Parsers...) if (is(T == Optional!S, S)) {
 	static if (is(T == Optional!S, S))
 		alias I = S;
+	alias leftMost = AliasSeq!S;
 	enum desc = "( " ~ getDesc!I ~ " )?";
 	alias innerRules = AliasSeq!I;
+	static bool calcEmptiness(in ref DFSState!bool) {
+		return true;
+	}
 	static Result!(R, T) parse(R, Alloc)(R i, ref Memo!(R, Alloc, Parsers) m, auto ref Alloc alloc) {
-		alias p = pathogen!(S, Parsers);
+		alias p = pathogenImpl!(S, Parsers);
 		auto r = p!(R, Alloc)(i, m, alloc);
 		T ret;
 		R next = r.is_ok ? r.next : i;
@@ -174,14 +218,16 @@ template genRuleImpl(T, Parsers...) if (is(T == Optional!S, S)) {
 				ret.v = r.result;
 			return Result!(R, T)(next, ret);
 		} else {
-			ret = r.result;
+			if (r.is_ok)
+				ret = r.result;
 			return Result!(R, T)(next, ret);
 		}
 	}
 }
 
 template getDesc(T) {
-	private enum getDesc = genRuleCon!T.desc;
+	alias rc = genRuleCon!T;
+	private enum getDesc = rc.desc;
 }
 
 template getNamedDesc(T) {
@@ -189,11 +235,20 @@ template getNamedDesc(T) {
 	private enum getNamedDesc = t.ruleName~" ::= "~t.desc;
 }
 
+private template getLeftMost(PGS pgs, Parsers...) {
+	alias getLeftMost(T) = genRuleCon!(T, pgs, Parsers).leftMost;
+}
+
 template genRuleImpl(T, Parsers...)
-if (is(T == _Token!tok[0], string tok)) {
-static if (is(T == _Token!tok[0], string tok)) {
+if (is(T == _Token!tok, string tok)) {
+	static if (is(T == _Token!_tok, string _tok))
+		enum tok = _tok;
 	alias innerRules = AliasSeq!();
+	alias leftMost = AliasSeq!();
 	enum desc = "\""~tok~"\"";
+	static bool calcEmptiness()(in ref DFSState!bool) {
+		return tok == "";
+	}
 	// Parse a 'tok' from the front of range 'i'.
 	// Result is discarded, because the only meaningful info
 	// is whether the 'tok' matches
@@ -204,13 +259,39 @@ static if (is(T == _Token!tok[0], string tok)) {
 		return Result!(R, T)(i[tok.length..$]);
 	}
 }
+
+template genRuleImpl(T, Parsers...) if (is(T == S[0], S)) {
+	static if (is(T == S[0], S))
+		alias rc = genRuleCon!(S, Parsers);
+	alias leftMost = AliasSeq!S;
+	alias innerRules = AliasSeq!(S, rc.innerRules);
+	enum desc = rc.desc;
+	static bool calcEmptiness()(ref DFSState!bool state) {
+		return .calcEmptiness!(S, Parsers)(state);
+	}
+	static if (is(typeof(rc.ruleName) == string))
+		enum ruleName = rc.ruleName ~ "_discarded";
+	static Result!(R, T) parse(R, Alloc)(R i, ref Memo!(R, Alloc, Parsers) m, auto ref Alloc alloc) {
+		alias p = pathogenImpl!(S, Parsers);
+		auto r = p!(R, Alloc)(i, m, alloc);
+		if (!r.is_ok)
+			return Result!(R, T)(r.err);
+		return Result!(R, T)(r.next, []);
+	}
 }
 
 template genRuleImpl(T, Parsers...)
 if (is(T == enum) && __traits(getAttributes, T).length != 0) {
 	private alias attr = AliasSeq!(__traits(getAttributes, T));
 	enum ruleName = T.stringof;
-	alias innerRules = AliasSeq!(attr);
+	alias innerRules = AliasSeq!attr;
+	alias leftMost = attr;
+	static bool calcEmptiness()(ref DFSState!bool state) {
+		bool ret = false;
+		foreach(i; attr)
+			ret = ret || .calcEmptiness!(i, Parsers)(state);
+		return ret;
+	}
 	private static auto dumpEnum() {
 		alias members = EnumMembers!T;
 		static assert(members.length == attr.length,
@@ -228,21 +309,35 @@ if (is(T == enum) && __traits(getAttributes, T).length != 0) {
 
 		static assert(members.length == attr.length,
 		              "Number of tokens doesn't much the number of enum members");
-		return Result!(R, T)(VoidError.init);
+		foreach(j, a; attr) {
+			alias p = pathogenImpl!(a, Parsers);
+			auto r = p!(R, Alloc)(i, m, alloc);
+			if (r.is_ok)
+				return Result!(R, T)(i, members[j]);
+		}
+		return Result!(R, T)(ParserError.init);
 	}
 }
 
-version(none) {
-template pathogen(T: VariantN!(max, U), size_t max, U...) {
-	Result!(R, T) pathogen(R, Alloc)(R i, Alloc alloc) {
-
+template leftMostOfSeq(P...) {
+	static if (hasPGS!P) {
+		private enum pgs = P[0];
+		private alias Parsers = P[1..$];
+		template leftMostOfSeqImpl(T...) {
+			static if (T.length == 0)
+				alias leftMostOfSeqImpl = AliasSeq!();
+			else {
+				private enum id = staticIndexOf!(T[0], Parsers);
+				static if (pgs.matchesEmpty[id])
+					alias leftMostOfSeqImpl = DedupPrepend!(T[0], leftMostOfSeqImpl!(T[1..$]));
+				else
+					alias leftMostOfSeqImpl = AliasSeq!(T[0]);
+			}
+		}
+		alias leftMostOfSeq = leftMostOfSeqImpl;
+	} else {
+		alias leftMostOfSeq(T...) = AliasSeq!();
 	}
-}
-
-template genRuleImpl(T: VariantN!(max, U), size_t max, U...) {
-	alias innerRules = U;
-	enum desc = orRulesDesc!U;
-}
 }
 
 /+ Generate parser for classes.
@@ -257,10 +352,43 @@ template genRuleImpl(T, Parsers...) if (is(T == class) && !hasUDA!(T, internal))
 	// class rules ::= self | all variants
 	alias innerRules = AliasSeq!(Fields!T, getClassVariants!T);
 	private alias v = getClassVariants!T;
+	private alias l = leftMostOfSeq!Parsers;
+	alias leftMost = AliasSeq!(l!(Fields!T), v);
 	enum desc = seqRulesDesc!(Fields!T)~(v.length ? " | "~orRulesDesc!(getClassVariants!T) : "");
 	enum ruleName = T.stringof;
+	static bool calcEmptiness()(ref DFSState!bool state) {
+		auto ret = true;
+		foreach(i; Fields!T)
+			ret = ret && .calcEmptiness!(i, Parsers)(state);
+		foreach(i; v)
+			ret = ret || .calcEmptiness!(i, Parsers)(state);
+		return ret;
+	}
 
-	static Result!(R, T) parse(R, Alloc)(R i, ref Memo!(R, Alloc, Parsers) m, auto ref Alloc alloc) {
+	@trusted static Result!(R, T) parse(R, Alloc)(R i, ref Memo!(R, Alloc, Parsers) m, auto ref Alloc alloc) {
+		bool parsed = true;
+		R next = i;
+		Fields!T f;
+		foreach(fi, F; Fields!T) {
+			alias p = pathogenImpl!(F, Parsers);
+			auto r = p!(R, Alloc)(next, m, alloc);
+			if (!r.is_ok) {
+				parsed = false;
+				break;
+			}
+			f[fi] = r.result;
+			next = r.next;
+		}
+		if (parsed)
+			return Result!(R, T)(next, alloc.make!T(f));
+
+		foreach(v; getClassVariants!T) {
+			alias p = pathogenImpl!(v, Parsers);
+			auto r = p!(R, Alloc)(i, m, alloc);
+			if (r.is_ok)
+				return Result!(R, T)(r.next, cast(T)r.result);
+		}
+
 		return Result!(R, T)(ParserError.init);
 	}
 }
@@ -274,20 +402,50 @@ template genRuleImpl(T, Parsers...) if (is(T == struct) && !hasUDA!(T, internal)
 	alias innerRules = Fields!T;
 	enum ruleName = T.stringof;
 	enum desc = seqRulesDesc!innerRules;
+	private alias l = leftMostOfSeq!Parsers;
+	alias leftMost = l!(Fields!T);
+	static bool calcEmptiness()(ref DFSState!bool state) {
+		auto ret = true;
+		foreach(i; innerRules)
+			ret = ret && .calcEmptiness!(i, Parsers)(state);
+		return ret;
+	}
 	static Result!(R, T) parse(R, Alloc)(R i, ref Memo!(R, Alloc, Parsers) m, auto ref Alloc alloc) {
-		return Result!(R, T)(i, T.init);
+		bool parsed = true;
+		R next = i;
+		Fields!T f;
+		foreach(fi, F; Fields!T) {
+			alias p = pathogenImpl!(F, Parsers);
+			auto r = p!(R, Alloc)(next, m, alloc);
+			if (!r.is_ok) {
+				parsed = false;
+				debug writeln(F.stringof~" parse failed");
+				break;
+			}
+			debug(StructParser) writeln(F.stringof~" parse succeeded");
+			f[fi] = r.result;
+			next = r.next;
+		}
+		if (parsed)
+			return Result!(R, T)(next, T(f));
+		return Result!(R, T)(ParserError.init);
 	}
 }
 
-template genRuleImpl(T, Parsers...) if (is(T == S*, S) && !is(S == class)) {
+template genRuleImpl(T, Parsers...) if (is(T == S*, S) && !is(S == class) && !is(T == Optional!V, V)) {
 	static if (is(T == S_*, S_))
 		alias S = S_;
-	private alias rc = genRuleCon!S;
-	alias innerRules = AliasSeq!(S, rc.innerRules);
-	enum desc = rc.desc;
+	private alias rc = genRuleCon!(S, Parsers);
+	private alias allM = AliasSeq!(__traits(allMembers, rc)); // Hack for issue 19190
+	alias innerRules = S;
+	enum desc = rc.ruleName;
 	enum ruleName = rc.ruleName~"_ptr";
+	alias leftMost = AliasSeq!S;
+	static bool calcEmptiness()(ref DFSState!bool state) {
+		return .calcEmptiness!(S, Parsers)(state);
+	}
 	static Result!(R, T) parse(R, Alloc)(R i, ref Memo!(R, Alloc, Parsers) m, auto ref Alloc alloc) {
-		alias p = pathogen!(S, Parsers);
+		alias p = pathogenImpl!(S, Parsers);
 		auto r = p!(R, Alloc)(i, m, alloc);
 		if (!r.is_ok)
 			return Result!(R, T)(r.err);
@@ -319,6 +477,215 @@ private template ruleClosure(T...) {
 
 private enum hasName(T) = is(typeof(genRuleCon!T.ruleName) == string);
 
+struct DFSState(T) {
+	T[] result;
+	bool[int] visited;
+	this(int size) {
+		result = new T[size];
+	}
+}
+
+private bool calcEmptiness(Now, Parsers...)(ref DFSState!bool state) {
+	assert(__ctfe);
+	auto id = staticIndexOf!(Now, Parsers);
+	assert(id >= 0);
+	if (id in state.visited)
+		return state.result[id];
+	state.result[id] = false;
+	state.visited[id] = true;
+	alias rc = genRuleCon!(Now, Parsers);
+	state.result[id] = rc.calcEmptiness(state);
+	return state.result[id];
+}
+
+private auto calcEmptiness(Parsers...)() {
+	assert(__ctfe);
+	auto state = DFSState!bool(Parsers.length);
+	foreach(i; Parsers)
+		calcEmptiness!(i, Parsers)(state);
+	return state.result;
+}
+
+private template getAdjacent(P, PGS pgs, Parsers...) {
+	private alias l = getLeftMost!(pgs, Parsers);
+	enum getAdjacent = [staticMap!(ApplyRight!(staticIndexOf, Parsers), l!P)];
+}
+
+private bool[] calcLeftRecursiveness(PGS pgs, Parsers...)() {
+	enum g = [staticMap!(ApplyRight!(getAdjacent, pgs, Parsers), Parsers)];
+	enum scc = g.scc;
+	alias l = getLeftMost!(pgs, Parsers);
+	uint[] mcnt = new uint[Parsers.length+1];
+	foreach(i; scc)
+		mcnt[i]++;
+	bool[] ret = new bool[Parsers.length];
+	foreach(i, P; Parsers)
+		ret[i] = (mcnt[scc[i]] != 1) || (staticIndexOf!(P, l!P) != -1);
+	return ret;
+}
+
+template pathogenImpl(T, PGS pgs, Parsers...) {
+	static assert(Parsers.length > 0);
+	private enum pid = staticIndexOf!(T, Parsers);
+	auto nonlrImpl(R, Alloc)(R i, ref Memo!(R, Alloc, pgs, Parsers) m, auto ref Alloc alloc) {
+		auto r = m.get!T(i);
+		if (r !is null)
+			return r.ans;
+		size_t prev_offset = m.update_offset(i);
+		auto r2 = genRuleCon!(T, pgs, Parsers).parse!(R, Alloc)(i, m, alloc);
+		m.put(i, r2);
+		m.update_offset(prev_offset);
+		return r2;
+
+	}
+	auto lrImpl(R, Alloc)(R i, ref Memo!(R, Alloc, pgs, Parsers) m, auto ref Alloc alloc) {
+		debug(LR) {
+			import std.stdio;
+			writeln("Parsing left recursive "~T.stringof);
+		}
+		auto mr = m.get!T(i);
+		debug(LR) writeln(m.m[i.offset]);
+		if (mr !is null) {
+			if (i.offset != m.offset) {
+				assert(!mr.tentative);
+				debug(LR) writeln("Move on to next offset");
+				return mr.ans;
+			}
+			if (!mr.tentative) {
+				debug(LR) writeln("Result not tentative");
+				return mr.ans;
+			}
+			if (mr.index != 0) {
+				debug(LR) writeln("Use tentative result");
+				// this parser has been called in this round
+				// just update lowlink
+				m.update_current_lowlink(i, mr.index);
+				return mr.ans;
+			}
+			// first time this parser is call in current round
+			// retry parsing
+			debug(LR) writeln("Retry parsing");
+		} else
+			debug(LR) writeln("No record found");
+
+		size_t prev_offset = m.update_offset(i);
+		uint prev_parser = m.update_parser!T;
+
+		if (mr is null) {
+			// add a tentative entry
+			debug(LR) writeln("Create new record");
+			auto r = Result!(R, T)(ParserError.init);
+			m.put(i, r, m.index++);
+			mr = m.get!T(i);
+		} else {
+			debug(LR) writeln("Update old record");
+			mr.index = m.index++;
+			mr.lowlink = mr.index;
+		}
+
+		// push parser T onto stack
+		m.push!T(i);
+		alias parse = genRuleCon!(T, pgs, Parsers).parse;
+		auto r = parse!(R, Alloc)(i, m, alloc);
+		if (r.next_offset > mr.ans.next_offset)
+			mr.ans = r;
+		bool progress = true;
+		while (mr.lowlink == mr.index && progress) {
+			debug(LR) writeln(T.stringof~" is SCC head");
+			if (r.is_ok) {
+				debug(LR) writeln("Current progress: ", i, "->", r.next);
+			}
+			// 1. get involved set by poping from stack
+			uint[Parsers.length] involved = void;
+			long[Parsers.length] next_offset = void;
+			long this_next_offset = r.next_offset;
+			uint ninvolved;
+			while (m.front(i) != pid)
+				involved[ninvolved++] = m.pop(i);
+			// 2. reset their index and lowlink
+			foreach(id; involved[0..ninvolved]) {
+				m.clear_index_lowlink(i, id);
+				next_offset[id] = m.get_next_offset(i, id);
+			}
+			// 3. retry parsing T
+			r = parse!(R, Alloc)(i, m, alloc);
+			// 4. check if any of involved parser made progress
+			progress = r.next_offset > this_next_offset;
+			if (!progress) {
+				foreach(id; involved[0..ninvolved]) {
+					if (next_offset[id] > m.get_next_offset(i, id)) {
+						progress = true;
+						debug(LR) writeln(Parsers.stringof,"[", id, "] made progress");
+						break;
+					}
+				}
+			} else {
+				debug(LR) writeln("Self made progress");
+				mr.ans = r;
+			}
+			// 5. go to step 7 if no progress is made
+			debug(LR) if (progress)
+				// 6. go to loop condition
+				writeln("Made progress");
+		}
+		debug(LR) writeln("Finishing up round of parsing, "~T.stringof);
+		if (mr.lowlink == mr.index) {
+			// If we still are the head of SCC
+			// 7. clear tentative flag in all involved parser results
+			//    including myself, break
+			debug(LR) writeln("Mark as not tenative");
+			while (m.front(i) != pid)
+				m.clear_tenative(i, m.pop(i));
+			m.clear_tenative!T(i);
+			m.pop(i);
+		} else {
+			// Otherwise, we are no longer head of SCC after this round
+			// We cannot mark anything not tentative
+			debug(LR) writeln("No longer head of SCC");
+		}
+		m.update_parser(prev_parser);
+		if (prev_offset == m.offset)
+			m.update_current_lowlink(i, mr.lowlink);
+		else
+			m.update_offset(prev_offset);
+		return mr.ans;
+	}
+
+	Result!(R, T) pathogenImpl(R, Alloc)(R i, ref Memo!(R, Alloc, pgs, Parsers) m, auto ref Alloc alloc) {
+		static if (pgs.leftRecursive[pid])
+			return lrImpl!(typeof(i), Alloc)(i, m, alloc);
+		else
+			return nonlrImpl!(typeof(i), Alloc)(i, m, alloc);
+	}
+
+	auto pathogenImpl(R, Alloc)(R i, auto ref Alloc alloc) {
+		static if (isRangeAcceptable!R) {
+			auto m = Memo!(R, Alloc, Parsers)(alloc);
+			auto j = i;
+		} else {
+			static assert(isRangeAcceptable!(offsetRange!R));
+			auto m = Memo!(offsetRange!R, Alloc, pgs, Parsers)(alloc);
+			auto j = i.withOffset;
+		}
+		static if (pgs.leftRecursive[pid])
+			auto r = lrImpl!(typeof(j), Alloc)(j, m, alloc);
+		else
+			auto r = nonlrImpl!(typeof(j), Alloc)(j, m, alloc);
+		foreach(ss; m.stack)
+			assert(ss.top == 0);
+		return r;
+	}
+}
+
+template pathogen(T) {
+	private alias allRules = ruleClosure!T;
+	private enum emptiness = calcEmptiness!allRules();
+	private enum pgs = PGS(emptiness,
+	    calcLeftRecursiveness!(PGS(emptiness, []), allRules)());
+	mixin pathogenImpl!(T, pgs, allRules);
+	alias pathogen = pathogenImpl;
+}
+
 template dumpRules(T...) {
 	private static string impl() {
 		return [ staticMap!(getNamedDesc, T) ].join("\n");
@@ -330,31 +697,11 @@ template dumpCompleteRule(T) {
 	enum dumpCompleteRule = dumpRules!(Filter!(hasName, ruleClosure!T));
 }
 
-template pathogen(T, Parsers...) {
-	static if (Parsers.length == 0)
-		private alias allRules = ruleClosure!T;
-	else
-		private alias allRules = Parsers;
-	auto pathogen(R, Alloc)(R i, ref Memo!(R, Alloc, allRules) m, auto ref Alloc alloc) {
-		auto r = m.get!T(i);
-		if (r !is null)
-			return r.ans;
-		auto r2 = genRuleCon!(T, allRules).parse!(R, Alloc)(i, m, alloc);
-		m.put(i, r2);
-		return r2;
-	}
-
-	auto pathogen(R, Alloc)(R i, auto ref Alloc alloc) {
-		static if (isRangeAcceptable!R) {
-			auto m = Memo!(R, Alloc, allRules)(alloc);
-			auto j = i;
-		} else {
-			static assert(isRangeAcceptable!(offsetRange!R));
-			auto m = Memo!(offsetRange!R, Alloc, allRules)(alloc);
-			auto j = i.withOffset;
-		}
-		return pathogen!(typeof(j), Alloc)(j, m, alloc);
-	}
+private template debugInternal(T) {
+	private alias allRules = ruleClosure!T;
+	private enum pgs = PGS(calcEmptiness!allRules());
+	private alias rc = genRuleCon!(T, pgs, allRules);
+	alias leftMost = rc.leftMost;
 }
 
 unittest {
@@ -386,22 +733,37 @@ unittest {
 		E.Op o1;
 		E.Op o2;
 	}
-	pragma(msg, dumpCompleteRule!s1);
+	pragma(msg, dumpCompleteRule!(s1*));
 	auto r3 = pathogen!(s1*)(""d, GCAllocator.instance);
-	writeln(*r3.result);
+	writeln(r3.is_ok);
+
+	struct lr1 {
+		Optional!(lr1*) a;
+		Token!"+1" b;
+	}
+	auto tmp = pathogen!lr1("+1+1+1"d, GCAllocator.instance);
+	assert(tmp.is_ok);
+	writeln(tmp);
 
 	struct s2 {
 		Token!"1" a;
 		s1 op;
 		Token!"2" b;
 	}
+
 	pragma(msg, dumpCompleteRule!s2);
 
-	@surround!(Token!"(", Token!")", true)
 	struct s3 {
+		Optional!(Token!"asdf") x;
+		Token!"qwer" y;
+	}
+	static assert(is(debugInternal!s3.leftMost == AliasSeq!(Optional!(Token!"asdf"), Token!"qwer")));
+
+	@surround!(Token!"(", Token!")", true)
+	struct s4 {
 		Token!"asdf" x;
 	}
-	pragma(msg, dumpCompleteRule!s3);
+	pragma(msg, dumpCompleteRule!s4);
 
 	//auto r2 = genParser!Op("+"d);
 	class Z { }
@@ -409,5 +771,9 @@ unittest {
 	pragma(msg, dumpCompleteRule!C1);
 
 	pragma(msg, getDesc!(Optional!C1));
+
+	auto r = pathogen!A("xxxzj"d, GCAllocator.instance);
+	pragma(msg, dumpCompleteRule!A);
+	writeln(r.is_ok);
 }
 }
